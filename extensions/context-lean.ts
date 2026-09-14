@@ -1,5 +1,6 @@
-import { type ContextEvent, type ExtensionAPI, loadSkills, getAgentDir } from "@earendil-works/pi-coding-agent";
-import { readFileSync } from "node:fs";
+import { type ContextEvent, type ExtensionAPI, loadSkills, getAgentDir, parseSkillBlock } from "@earendil-works/pi-coding-agent";
+import { homedir } from "node:os";
+import { basename, isAbsolute, normalize, resolve } from "node:path";
 import { stripVTControlCharacters } from "node:util";
 
 // Extract plain text from a message's content field, which is either a
@@ -18,12 +19,20 @@ function extractText(content: unknown): string {
   return "";
 }
 
-// Matches lines like: [[UNLOAD_SKILL: my-skill-name]]
-// Capture group 1 pulls out just the skill name.
-const UNLOAD_PATTERN = /\[\[UNLOAD_SKILL:\s*([a-z0-9-]+)\]\]/g;
+type ContextMessage = ContextEvent["messages"][number];
 
-function findUnloadRequests(text: string): string[] {
-  return [...text.matchAll(UNLOAD_PATTERN)].map((match) => match[1]);
+function findUnloadRequests(message: ContextMessage): string[] {
+  if (message.role !== "assistant" || message.stopReason !== "stop" ||
+      message.content.length === 0 ||
+      !message.content.every((block) => block.type === "text" && typeof block.text === "string")) return [];
+  const lines = extractText(message.content).trim().split("\n").filter((line) => line.trim());
+  const names = new Set<string>();
+  for (const line of lines) {
+    const match = /^\[\[UNLOAD_SKILL:[^\S\r\n]*([a-z0-9-]+)[^\S\r\n]*\]\]$/.exec(line.trim());
+    if (!match) return [];
+    names.add(match[1]);
+  }
+  return [...names];
 }
 
 function unloadPlaceholder(skillName: string): string {
@@ -34,65 +43,304 @@ function duplicatePlaceholder(skillName: string): string {
   return `[skill "${skillName}" was loaded again - keeping only the most recent copy in context]`;
 }
 
-// One reason + replacement text for stripping a skill's content out of a
-// specific message. Different messages can carry different entries for the
-// same skill (e.g. an early duplicate load vs. a later real unload).
-interface StripEntry {
-  content: string;
-  placeholder: string;
+// Identity is lexical, never a lookup of today's skill body or inode. Relative
+// paths need the session cwd, not the extension process's current directory.
+function skillPath(value: unknown, cwd: string | undefined): string | undefined {
+  if (typeof value !== "string" || !value || value.includes("\0")) return undefined;
+  let path = value.replace(/[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g, " ").replace(/^@/, "");
+  if (path.startsWith("~/")) path = resolve(homedir(), path.slice(2));
+  // The native reader may try filesystem-dependent spelling fallbacks for
+  // these paths. History does not reveal which spelling succeeded.
+  if (path.normalize("NFD") !== path || path.includes("'") || / (AM|PM)\./.test(path)) return undefined;
+  // Leave unsupported native path aliases alone rather than guessing.
+  if (process.platform === "win32" && /^\/(?:mnt\/|cygdrive\/)?[a-z](?:\/|$)/i.test(path)) return undefined;
+  if (!path || path.startsWith("~") || (/^[a-z][a-z0-9+.-]*:/i.test(path) && !isAbsolute(path))) return undefined;
+  if (isAbsolute(path)) return normalize(path);
+  return cwd ? resolve(cwd, path) : undefined;
 }
 
-// Record that the message at `index` should have `name`'s content stripped,
-// using the given placeholder. Creates the per-index map on first use.
-function markStrip(
-  stripAtIndex: Map<number, Map<string, StripEntry>>,
-  index: number,
-  name: string,
-  content: string,
-  placeholder: string,
-): void {
-  const entries = stripAtIndex.get(index) ?? new Map<string, StripEntry>();
-  entries.set(name, { content, placeholder });
-  stripAtIndex.set(index, entries);
+function record(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown> : undefined;
 }
 
-// Replace every occurrence of each entry's cached content inside a single
-// text string with that entry's placeholder.
-function stripText(text: string, entries: Map<string, StripEntry>): string {
-  let result = text;
-  for (const [, entry] of entries) {
-    if (result.includes(entry.content)) {
-      result = result.split(entry.content).join(entry.placeholder);
+function positiveInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+
+interface Coverage {
+  start: number;
+  end: number;
+  eof?: number;
+}
+
+// Pi 0.85.1's single built-in read: metadata proves line-truncated coverage;
+// only an unlimited, untruncated text result proves EOF. Never parse footers.
+function readCoverage(args: Record<string, unknown>, result: ContextMessage): Coverage | undefined {
+  if (result.role !== "toolResult" || result.isError !== false || result.content.length !== 1 ||
+      result.content[0].type !== "text" || typeof result.content[0].text !== "string") return undefined;
+  const start = args.offset === undefined ? 1 : args.offset;
+  if (!positiveInteger(start) || (args.limit !== undefined && !positiveInteger(args.limit))) return undefined;
+  let lines: number;
+  let eof = false;
+  if (result.details === undefined) {
+    if (args.limit !== undefined) return undefined;
+    lines = result.content[0].text.split("\n").length;
+    eof = true;
+  } else {
+    const truncation = record(record(result.details)?.truncation);
+    if (!truncation || truncation.truncated !== true || truncation.truncatedBy !== "lines" ||
+        truncation.firstLineExceedsLimit !== false || truncation.lastLinePartial !== false ||
+        !positiveInteger(truncation.outputLines) || !positiveInteger(truncation.totalLines) ||
+        truncation.outputLines >= truncation.totalLines || typeof truncation.content !== "string" ||
+        truncation.content.split("\n").length !== truncation.outputLines ||
+        !result.content[0].text.startsWith(`${truncation.content}\n\n`) ||
+        (positiveInteger(args.limit) && truncation.totalLines > args.limit)) return undefined;
+    lines = truncation.outputLines;
+  }
+  const end = start + lines - 1;
+  return Number.isSafeInteger(end) ? { start, end, eof: eof ? end : undefined } : undefined;
+}
+
+interface Payload {
+  index: number;
+  // Read payloads retain their tool-result envelope. Wrapper payloads retain
+  // their exact prefix/suffix, including user arguments and their whitespace.
+  wrapper?: { block: number | undefined; start: number; end: number };
+}
+
+interface SkillLoad {
+  path: string;
+  payloads: Payload[];
+  intervals: Array<[number, number]>;
+  eof?: number;
+  lastIndex: number;
+  status: "candidate" | "active" | "superseded" | "unloaded";
+}
+
+interface ReadInvocation {
+  id: string;
+  index: number;
+  path: string;
+  args: Record<string, unknown>;
+  resultIndex?: number;
+  concurrent: boolean;
+}
+
+interface WrapperLoad {
+  path: string;
+  payload: Payload;
+}
+
+function addName(names: Map<string, Set<string>>, name: string, path: string): void {
+  const paths = names.get(name) ?? new Set<string>();
+  paths.add(path);
+  names.set(name, paths);
+}
+
+function extendCoverage(load: SkillLoad, coverage: Coverage): boolean {
+  const intervals = [...load.intervals, [coverage.start, coverage.end] as [number, number]]
+    .sort((a, b) => a[0] - b[0]);
+  load.intervals = [];
+  for (const interval of intervals) {
+    const last = load.intervals[load.intervals.length - 1];
+    if (last && interval[0] <= last[1] + 1) last[1] = Math.max(last[1], interval[1]);
+    else load.intervals.push([...interval]);
+  }
+  if (coverage.eof !== undefined) load.eof = coverage.eof;
+  return load.eof !== undefined && load.intervals.length === 1 &&
+    load.intervals[0][0] === 1 && load.intervals[0][1] === load.eof;
+}
+
+function omitPayload(message: ContextMessage, payload: Payload, notice: string): ContextMessage {
+  if (!payload.wrapper) {
+    if (message.role !== "toolResult") return message;
+    const details = record(message.details);
+    const truncation = record(details?.truncation);
+    return {
+      ...message,
+      content: [{ type: "text", text: notice }],
+      // Native truncation metadata also carries a copy of the returned text.
+      ...(truncation ? { details: { ...details, truncation: { ...truncation, content: notice } } } : {}),
+    };
+  }
+  if (message.role !== "user") return message;
+  const { block, start, end } = payload.wrapper;
+  const replace = (text: string) => text.slice(0, start) + notice + text.slice(end);
+  if (typeof message.content === "string") return { ...message, content: replace(message.content) };
+  return { ...message, content: message.content.map((part, index) =>
+    index === block && part.type === "text" ? { ...part, text: replace(part.text) } : part) };
+}
+
+function reconstructSkillLoads(
+  messages: ContextEvent["messages"],
+  cwd: string | undefined,
+  discovered: Map<string, Set<string>>,
+): { messages: ContextEvent["messages"]; omittedPayloads: number } {
+  // All message positions, candidates and lifecycle decisions are rebuilt
+  // from this context. Never retain them across branches or compaction.
+  const names = new Map([...discovered].map(([name, paths]) => [name, new Set(paths)]));
+  const knownPaths = new Set([...names.values()].flatMap((paths) => [...paths]));
+  const wrappers = new Map<number, WrapperLoad[]>();
+  messages.forEach((message, index) => {
+    if (message.role !== "user") return;
+    const inspect = (text: string, block: number | undefined) => {
+      const parsed = parseSkillBlock(text);
+      if (!parsed) return;
+      const path = skillPath(parsed.location, cwd);
+      if (!path) return;
+      const start = `<skill name="${parsed.name}" location="${parsed.location}">\n`.length;
+      const payload = { index, wrapper: { block, start, end: start + parsed.content.length } };
+      const entries = wrappers.get(index) ?? [];
+      entries.push({ path, payload });
+      wrappers.set(index, entries);
+      knownPaths.add(path);
+      addName(names, parsed.name, path);
+    };
+    if (typeof message.content === "string") inspect(message.content, undefined);
+    else message.content.forEach((block, i) => { if (block.type === "text") inspect(block.text, i); });
+  });
+
+  const callCounts = new Map<string, number>();
+  const resultIndexes = new Map<string, number[]>();
+  const reads: ReadInvocation[] = [];
+  messages.forEach((message, index) => {
+    if (message.role === "toolResult") {
+      const indexes = resultIndexes.get(message.toolCallId) ?? [];
+      indexes.push(index);
+      resultIndexes.set(message.toolCallId, indexes);
+    }
+    if (message.role !== "assistant") return;
+    for (const call of message.content) {
+      if (call.type !== "toolCall") continue;
+      callCounts.set(call.id, (callCounts.get(call.id) ?? 0) + 1);
+      if (call.name !== "read") continue;
+      const args = record(call.arguments);
+      const path = skillPath(args?.path, cwd);
+      if (!args || !path || (basename(path) !== "SKILL.md" && !knownPaths.has(path))) continue;
+      reads.push({ id: call.id, index, path, args, concurrent: false });
+    }
+  });
+
+  const readsByPath = new Map<string, ReadInvocation[]>();
+  const readResults = new Map<number, ReadInvocation>();
+  const callsAtIndex = new Map<number, ReadInvocation[]>();
+  for (const read of reads) {
+    const indexes = resultIndexes.get(read.id);
+    if (callCounts.get(read.id) === 1 && indexes?.length === 1 && indexes[0] > read.index) {
+      const result = messages[indexes[0]];
+      if (result.role === "toolResult" && result.toolName === "read") {
+        read.resultIndex = indexes[0];
+        readResults.set(indexes[0], read);
+      }
+    }
+    const siblings = readsByPath.get(read.path) ?? [];
+    siblings.push(read);
+    readsByPath.set(read.path, siblings);
+    const calls = callsAtIndex.get(read.index) ?? [];
+    calls.push(read);
+    callsAtIndex.set(read.index, calls);
+  }
+  // Calls are already chronological. Every overlapping same-path call cluster
+  // is uncertain, irrespective of the order in which its results arrived.
+  for (const siblings of readsByPath.values()) {
+    let cluster: ReadInvocation[] = [];
+    let end = -1;
+    for (const read of siblings) {
+      if (read.index > end) cluster = [];
+      if (cluster.length > 0) {
+        read.concurrent = true;
+        for (const previous of cluster) previous.concurrent = true;
+      }
+      end = cluster.length === 0 ? read.resultIndex ?? Infinity : Math.max(end, read.resultIndex ?? Infinity);
+      cluster.push(read);
     }
   }
-  return result;
-}
-
-// Rewrite one message's content field, leaving the message untouched if
-// nothing needed stripping.
-function withStripped(message: unknown, entries: Map<string, StripEntry>): unknown {
-  const content = (message as { content?: unknown }).content;
-
-  if (typeof content === "string") {
-    const stripped = stripText(content, entries);
-    if (stripped === content) return message;
-    return { ...(message as Record<string, unknown>), content: stripped };
+  for (const [index, entries] of wrappers) {
+    for (const wrapper of entries) {
+      for (const read of readsByPath.get(wrapper.path) ?? []) {
+        if (read.index < index && (read.resultIndex ?? Infinity) > index) read.concurrent = true;
+      }
+    }
   }
 
-  if (Array.isArray(content)) {
-    let changed = false;
-    const newContent = content.map((block) => {
-      if (block?.type !== "text") return block;
-      const stripped = stripText(block.text as string, entries);
-      if (stripped === block.text) return block;
-      changed = true;
-      return { ...block, text: stripped };
-    });
-    if (!changed) return message;
-    return { ...(message as Record<string, unknown>), content: newContent };
-  }
+  const loadsByPath = new Map<string, SkillLoad[]>();
+  const candidates = new Map<string, SkillLoad>();
+  const create = (path: string, index: number): SkillLoad => {
+    const load: SkillLoad = { path, payloads: [], intervals: [], lastIndex: index, status: "candidate" };
+    const loads = loadsByPath.get(path) ?? [];
+    loads.push(load);
+    loadsByPath.set(path, loads);
+    return load;
+  };
+  const activate = (load: SkillLoad) => {
+    for (const earlier of loadsByPath.get(load.path) ?? []) {
+      if (earlier !== load && (earlier.status === "candidate" || earlier.status === "active")) {
+        earlier.status = "superseded";
+      }
+    }
+    load.status = "active";
+    candidates.delete(load.path);
+  };
+  messages.forEach((message, index) => {
+    for (const read of callsAtIndex.get(index) ?? []) {
+      if (read.resultIndex === undefined || read.concurrent || read.args.offset === undefined || read.args.offset === 1) {
+        candidates.delete(read.path);
+      }
+    }
+    for (const wrapper of wrappers.get(index) ?? []) {
+      const load = create(wrapper.path, index);
+      load.payloads.push(wrapper.payload);
+      activate(load);
+    }
+    const read = readResults.get(index);
+    if (read && message.role === "toolResult") {
+      const start = read.args.offset === undefined ? 1 : read.args.offset;
+      // Failures/non-text/malformed results stay verbatim, even on unload.
+      if (message.isError !== false || message.content.length !== 1 || message.content[0].type !== "text" ||
+          typeof message.content[0].text !== "string" || !positiveInteger(start) ||
+          (read.args.limit !== undefined && !positiveInteger(read.args.limit))) {
+        candidates.delete(read.path);
+      } else {
+        let load = !read.concurrent && start !== 1 ? candidates.get(read.path) : undefined;
+        if (load && load.lastIndex >= read.index) load = undefined;
+        if (!load) load = create(read.path, index);
+        load.payloads.push({ index });
+        load.lastIndex = index;
+        if (read.concurrent) candidates.delete(read.path);
+        else {
+          if (start === 1) candidates.set(read.path, load);
+          const coverage = readCoverage(read.args, message);
+          if (coverage && extendCoverage(load, coverage)) activate(load);
+        }
+      }
+    }
+    for (const name of findUnloadRequests(message)) {
+      const paths = names.get(name);
+      if (paths?.size !== 1) continue;
+      const path = [...paths][0];
+      for (const load of loadsByPath.get(path) ?? []) {
+        if (load.status === "candidate" || load.status === "active") load.status = "unloaded";
+      }
+      candidates.delete(path);
+    }
+  });
 
-  return message;
+  // Only exact payload references are rewritten. All call/result envelopes,
+  // unrelated exchanges and saved session objects remain intact.
+  const outgoing = [...messages];
+  let omittedPayloads = 0;
+  for (const loads of loadsByPath.values()) {
+    for (const load of loads) {
+      if (load.status !== "superseded" && load.status !== "unloaded") continue;
+      const notice = load.status === "unloaded" ? unloadPlaceholder(load.path) : duplicatePlaceholder(load.path);
+      for (const payload of load.payloads) {
+        outgoing[payload.index] = omitPayload(outgoing[payload.index], payload, notice);
+        omittedPayloads++;
+      }
+    }
+  }
+  return { messages: outgoing, omittedPayloads };
 }
 
 // These are character budgets, not semantic summaries. Never silently imply
@@ -147,7 +395,6 @@ interface CleanupStats {
 
 function digestToolExchanges(
   messages: ContextEvent["messages"],
-  protectedContent: Iterable<string>,
   stats: CleanupStats,
 ): ContextEvent["messages"] {
   // A normal final assistant reply is evidence that the preceding tool loop
@@ -161,7 +408,6 @@ function digestToolExchanges(
   });
   if (settledBefore < 0) return messages;
 
-  const protectedTexts = [...protectedContent].filter(Boolean);
   const digested: ContextEvent["messages"] = [];
   // Per-pass only: every reference must point to a digest emitted earlier in
   // this very context, never to an entry lost through branching/compaction.
@@ -188,8 +434,7 @@ function digestToolExchanges(
     // Removing that result would also remove the tool's load point.
     const protectedResult = results.some((result) => result.isError ||
       (result.addedToolNames?.length ?? 0) > 0 ||
-      result.content.some((block) => block.type !== "text") ||
-      protectedTexts.some((text) => extractText(result.content).includes(text)));
+      result.content.some((block) => block.type !== "text"));
     if (!complete || protectedResult) {
       if (complete && protectedResult) stats.protectedGroups++;
       digested.push(message);
@@ -242,23 +487,15 @@ function digestToolExchanges(
 }
 
 export default function (pi: ExtensionAPI) {
-  // Discover all currently-known skills once, at extension load time, and
-  // cache their full SKILL.md content keyed by skill name. This is the
-  // reference text we'll search for inside message content later.
-  const { skills } = loadSkills({
-    cwd: process.cwd(),
-    agentDir: getAgentDir(),
-    skillPaths: [],
-    includeDefaults: true,
-  });
-
-  const skillContent = new Map<string, string>();
-  for (const skill of skills) {
-    skillContent.set(skill.name, readFileSync(skill.filePath, "utf8"));
-  }
+  // Discovery supplies unload names only, never historical content evidence.
+  let discoveryCwd: string | undefined;
+  let discovered = new Map<string, Set<string>>();
 
   let latestStats: CleanupStats | undefined;
-  pi.on("session_start", () => { latestStats = undefined; });
+  pi.on("session_start", () => {
+    latestStats = undefined;
+    discoveryCwd = undefined;
+  });
   pi.registerCommand("context-lean", {
     description: "Show cleanup counts for the latest outgoing context (UI only)",
     handler: async (_args, ctx) => {
@@ -275,50 +512,38 @@ export default function (pi: ExtensionAPI) {
         `${saved >= 0 ? "Saved" : "Added"}: ${Math.abs(saved)} (${percent}%). Not tokens or final provider size.`,
         `Tool exchanges digested: ${s.digested}; repeated outputs referenced: ${s.repeated}`,
         `Outputs terminal-cleaned: ${s.cleaned}; exchanges excerpted: ${s.excerpted}`,
-        `Skill loads stripped: ${s.strippedSkills}; protected groups: ${s.protectedGroups}`,
+        `Skill payloads omitted (interim count): ${s.strippedSkills}; protected groups: ${s.protectedGroups}`,
+        `Tool digestion temporarily disabled pending lifecycle integration.`,
         `Tool results kept verbatim by digest pass: ${s.preservedResults} (includes active/incomplete groups)`,
       ].join("\n"), "info");
     },
   });
 
-  pi.on("context", (event) => {
-    // For every skill, replay the conversation in order and track which
-    // load of that skill is currently "active". A later load supersedes an
-    // earlier one (duplicate); an unload marker closes out whichever load
-    // is currently active. Anything still active at the end is untouched -
-    // this is what fixes stripping a load that happens AFTER an unload.
-    const stripAtIndex = new Map<number, Map<string, StripEntry>>();
-
-    for (const [name, content] of skillContent) {
-      let activeLoadIndex: number | null = null;
-
-      event.messages.forEach((message, index) => {
-        const text = extractText((message as { content?: unknown }).content);
-        const isLoad = text.includes(content);
-        const isUnload = findUnloadRequests(text).includes(name);
-
-        if (isLoad) {
-          if (activeLoadIndex !== null) {
-            markStrip(stripAtIndex, activeLoadIndex, name, content, duplicatePlaceholder(name));
-          }
-          activeLoadIndex = index;
+  pi.on("context", (event, ctx) => {
+    if (discoveryCwd !== ctx.cwd) {
+      discovered = new Map();
+      const { skills, diagnostics } = loadSkills({ cwd: ctx.cwd, agentDir: getAgentDir(), skillPaths: [], includeDefaults: true });
+      for (const skill of skills) {
+        const path = skillPath(skill.filePath, ctx.cwd);
+        if (path) addName(discovered, skill.name, path);
+      }
+      // Discovery returns only the winning skill; retain collision paths so
+      // a name-only unload cannot accidentally choose between distinct files.
+      for (const { collision } of diagnostics) {
+        if (collision?.resourceType !== "skill") continue;
+        for (const value of [collision.winnerPath, collision.loserPath]) {
+          const path = skillPath(value, ctx.cwd);
+          if (path) addName(discovered, collision.name, path);
         }
-
-        if (isUnload && activeLoadIndex !== null) {
-          markStrip(stripAtIndex, activeLoadIndex, name, content, unloadPlaceholder(name));
-          activeLoadIndex = null;
-        }
-      });
+      }
+      discoveryCwd = ctx.cwd;
     }
+    const sessionCwd = ctx.sessionManager.getHeader()?.cwd;
+    // A moved/resumed session with a different cwd cannot identify relative
+    // historical reads safely. Absolute identities still work in that case.
+    const cwd = sessionCwd === ctx.cwd ? sessionCwd : undefined;
+    const reconstructed = reconstructSkillLoads(event.messages, cwd, discovered);
 
-    const messages = event.messages.map((message, index) => {
-      const entries = stripAtIndex.get(index);
-      if (!entries) return message;
-      return withStripped(message, entries);
-    }) as typeof event.messages;
-
-    // Strip unloaded/duplicate skills first. Any skill body still present is
-    // active and must not be reduced to an excerpt by the tool digest pass.
     const stats: CleanupStats = {
       before: JSON.stringify(event.messages).length,
       after: 0,
@@ -328,9 +553,11 @@ export default function (pi: ExtensionAPI) {
       excerpted: 0,
       protectedGroups: 0,
       preservedResults: 0,
-      strippedSkills: [...stripAtIndex.values()].reduce((sum, entries) => sum + entries.size, 0),
+      strippedSkills: reconstructed.omittedPayloads,
     };
-    const outgoing = digestToolExchanges(messages, skillContent.values(), stats);
+    // Approved step-2 bridge: do not expose active/uncertain skill payloads to
+    // the generic digester until step 3 adds tool-call-ID protection.
+    const outgoing = reconstructed.messages;
     stats.after = JSON.stringify(outgoing).length;
     stats.preservedResults = outgoing.filter((message) => message.role === "toolResult").length;
     latestStats = stats;
