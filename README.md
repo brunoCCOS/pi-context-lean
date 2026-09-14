@@ -1,227 +1,188 @@
 # pi-context-lean
 
-A Pi extension that reduces repeated skill instructions and digests eligible
-historical tool exchanges in the context sent to the model. It leaves the full
-saved session transcript unchanged. It registers one extension and the
-`/context-lean` command; there is no custom installer.
+**Keep the instructions you need. Trim the history you don’t.**
 
-**Release status:** implementation and manual qualification are still in progress.
-No public repository URL or release tag is configured, and no npm publication is
-claimed. See [Verification status](#verification-status) before using it.
+A Pi extension that removes superseded skill instructions and condenses old tool exchanges before they reach the model.
+Your saved session transcript stays unchanged.
 
-## What changes in context
+Long sessions accumulate repeated skill loads, verbose command output, and tool
+results the assistant has already consumed. Context Lean reduces that repetition
+without treating an active skill as disposable just because its tool call is old.
 
-### Skill loads
+## What it does
 
-- Skill identity comes from the path in a built-in `read` call paired with its
-  result by call ID, or the location in a native `/skill:name` expansion—not from
-  matching instruction text against today's file contents.
-- The newest complete load stays active until a later complete load supersedes it
-  or an explicit unload retires it. A completed read does not mean the assistant
-  has finished using the skill.
-- Multipart reads are kept together conservatively. Earlier instructions retire
-  only when a replacement has proven contiguous coverage from line 1 through EOF.
-  A later chunk alone is not a replacement. Uncertain limit reads, gaps, ambiguous
-  grouping, missing pairs, and unknown EOF preserve instructions rather than
-  guessing. Explicit read limits may prevent proving completeness.
-- For recognized skill wrappers, only the retired instruction payload is omitted;
-  accompanying user arguments remain. Retired loads receive omission notices,
-  consolidated only where the tool protocol permits.
-- Paths are normalized with available cwd evidence. This is not universal
-  filesystem-alias deduplication or an atomic snapshot across multiple reads.
-  Lifecycle state is reconstructed from the available context each pass; history
-  lost through compaction cannot be reconstructed from current file contents.
+- **Keeps the latest complete skill load.** Rereading a skill replaces its older
+  instructions in outgoing context—even when the file’s contents have changed.
+- **Supports explicit unloading.** The assistant can retire a skill when it is
+  no longer needed, then load it again later.
+- **Condenses eligible tool history.** Completed exchanges become labeled
+  digests with bounded excerpts, cleaned terminal output, and references to
+  repeated results.
+- **Preserves uncertain cases.** Active skill instructions, incomplete reads,
+  errors, images, and unfinished tool exchanges stay out of generic digestion.
+- **Shows what changed.** `/context-lean` reports the latest pass’s size and
+  cleanup counts.
 
-### Explicit unload
+For example:
 
-Ask the assistant to emit a final reply containing only markers, for example:
+```text
+Session history                      Context sent to the model
+──────────────────────────────────   ──────────────────────────────────
+Read a skill                         Notice: older skill load omitted
+Read the same skill after an edit    Latest complete instructions
+Old, completed command exchange      Historical digest with excerpts
+Current tool exchange                Unchanged
+```
+
+This is a context transformation, not transcript deletion or a semantic summary.
+Tool digests are lossy; the original exchanges remain in the saved session.
+
+## Install
+
+With Pi installed, register your local checkout:
+
+```bash
+pi install /absolute/path/to/pi-context-lean
+```
+
+Start a fresh Pi session. The extension runs automatically before each model
+request; there is nothing else to enable in the conversation.
+
+For a project-only installation, use `pi install -l` instead. Local installations
+reference the checkout directly, so edits there affect the loaded extension.
+
+Pi also supports Git sources. Substitute this repository’s actual URL and an
+existing release tag:
+
+```bash
+pi install 'git:<host>/<owner>/pi-context-lean@<tag>'
+```
+
+Review extensions before installing them: they run with your system privileges.
+Install only one copy. If you already load a loose `context-lean.ts`, see
+[Migration](#migration).
+
+## Usage
+
+### Load skills normally
+
+Use Pi’s `/skill:name` command or let the assistant read a skill’s `SKILL.md` with
+the built-in `read` tool. Context Lean identifies loads by their paths and paired
+tool calls—not by searching for matching instruction text.
+
+A skill stays active until a complete replacement is available or the assistant
+explicitly unloads it. Paginated reads are combined only when continuous coverage
+from line 1 through EOF can be established. Uncertain reads preserve instructions
+rather than risk dropping them. User arguments accompanying `/skill:name` remain
+intact when older skill instructions are omitted.
+
+### Unload a skill
+
+Ask the assistant to unload a skill it no longer needs. It must emit a final reply
+containing only this marker, using the skill’s name:
 
 ```text
 [[UNLOAD_SKILL:example-skill]]
 ```
 
-This is **not** a slash command. The marker must come from a normally completed
-assistant message made solely of text blocks. Every nonblank line must be a valid
-marker; prose, quotation fences, tool calls, or other content invalidate the whole
-message. Names contain only lowercase letters, digits, and hyphens, and must
-resolve unambiguously to one skill path. Multiple markers may occupy separate
-lines.
+This is an **assistant marker, not a slash command**. Pasting it yourself does not
+unload anything. Multiple markers can appear on separate lines, but extra prose,
+code fences, tool calls, or an interrupted reply invalidate the message. Names
+must contain only lowercase letters, digits, and hyphens and identify one skill
+path unambiguously.
 
-Markers in user messages, tool output, reasoning, errors, or aborted assistant
-messages do not authorize unloading. A valid unload retires attributable loads
-already present; it does not prevent a later read from loading the skill again.
-Origin checks are not a security boundary: model-generated text can still be
-influenced by instructions it encounters.
+A subsequent read or `/skill:name` invocation loads the skill again.
 
-### Historical tool digests
+### Inspect the savings
 
-After a normal final assistant reply, eligible older, complete call/result groups
-may become labeled historical digests. These are **lossy**: terminal formatting is
-cleaned, arguments and outputs may be excerpted, and identical outputs may refer
-to an earlier digest in the same outgoing context.
+After a model request, run:
 
-The current tool loop, active or uncertain skill reads, mixed skill/unrelated
-groups, errors, non-text results, and ambiguous or incomplete groups stay out of
-generic digestion. Retired skill payloads may already contain omission notices
-inside otherwise retained groups. Digestion removes calls and their matching
-results together rather than leaving orphan results.
-
-If detail is needed again, ask the assistant to reread the file or consult the
-original saved transcript. Rerunning a command is appropriate only if its side
-effects are understood; a new read or run may observe different data.
-
-### Statistics
-
-Run `/context-lean` inside Pi after a model request. Its UI notification describes
-only the **latest outgoing context pass**, not a whole turn or cumulative savings:
-
-- Serialized message characters before and after, including any size increase.
-  These are not tokens or the final provider request size.
-- Digested exchanges, repeated-output references, terminal-cleaned outputs, and
-  excerpted exchanges.
-- Retired logical skill loads separately from individual instruction payloads
-  omitted, so a multipart load is not counted as several retired loads.
-- Complete groups protected from digestion and retained tool-result envelopes.
-  Retained envelopes may contain omission notices, not verbatim instructions.
-
-There is no guaranteed size, latency, cost, or performance improvement. The
-extension rescans available history on each context pass.
-
-## Install and manage
-
-**Review the source first.** Pi extensions execute with your system privileges.
-This package adds neither a sandbox nor a privacy guarantee. If migrating from a
-loose extension, follow the migration sequence below before enabling the package.
-
-With Pi installed, register your reviewed local checkout:
-
-```bash
-pi install /absolute/path/to/pi-context-lean
-pi list
-pi config
+```text
+/context-lean
 ```
 
-Local packages reference the checkout without copying it. Develop there, not in
-a Pi-managed Git clone. Global installation uses `~/.pi/agent/settings.json`;
-project installation uses `.pi/settings.json`:
+The notification reports:
+
+- Serialized message size before and after cleanup.
+- Digested exchanges, repeated-output references, and cleaned or excerpted output.
+- Retired skill loads and omitted payloads, counted separately for multipart reads.
+- Protected tool groups and retained tool-result envelopes.
+
+Figures describe the **latest context pass**, not cumulative savings. Sizes are
+characters, not tokens or the final provider request size; a pass can increase
+size. Retained tool-result envelopes may contain omission notices.
+
+## How tool digestion works
+
+Only complete historical call/result groups preceding a normal final assistant
+reply are eligible. The current tool loop remains intact. When a group is
+condensed, its calls and matching results are replaced together, avoiding orphan
+tool results.
+
+The digester preserves groups containing active or uncertain skill reads, errors,
+non-text results, or ambiguous pairing. Groups mixing skill reads with unrelated
+tools also remain intact, so retiring a skill does not shorten a sibling result.
+
+Digests retain excerpts, **not every detail**. If omitted information matters,
+consult the saved transcript or reread the source. Repeating a command may have
+side effects or return different data; it is not a substitute for the original
+record.
+
+## Manage the extension
 
 ```bash
-pi install -l /absolute/path/to/pi-context-lean
-pi config -l
+pi list                 # Show package registrations
+pi config               # Enable or disable resources
+pi update --extensions  # Update installed packages, not Pi itself
 ```
 
-Choose one scope. Do not copy the extension into both global and project
-auto-discovery directories. `pi config` starts with global settings and supports
-switching to project settings with Tab; `pi config -l` starts in project overrides.
-Use it to enable or disable the package's extension, then start a fresh session.
+Use `pi config -l` for project overrides. Pinned Git sources stay at their
+configured ref; install the same source with a different tag to change the pin.
+Keep development work in your own checkout, not Pi-managed Git clones, which may
+be reset during updates.
 
-Once the owner supplies a real remote and release tag, the Git install template
-is below. **Replace the placeholders; no such remote or tag is asserted here.**
-
-```bash
-pi install 'git:<host>/<owner>/<repository>@<tag>'
-```
-
-Prefer an explicit release tag for reproducibility. Manage package updates with:
-
-```bash
-pi update --extensions
-```
-
-Plain `pi update` updates Pi itself, not its packages. Unpinned Git sources follow
-Pi's native update behavior. Pinned refs are reconciled to their configured ref;
-updates do not select a newer tag. To change a pin, use `pi install` with the same
-repository source and the new tag. Pi-managed Git clones are disposable:
-reconciliation may reset and clean them. Never keep development work there.
-
-Disable the extension with `pi config`, or remove the local registration with:
+To remove a local installation:
 
 ```bash
 pi remove /absolute/path/to/pi-context-lean
-# If installed in project scope instead:
-pi remove -l /absolute/path/to/pi-context-lean
 ```
 
-For Git packages, use `pi remove <source>` with the configured source shown by
-`pi list`. Start a fresh session after disabling or removing a registration.
+Add `-l` if you installed it in project scope. For Git installations, remove the
+configured source shown by `pi list`. Start a fresh session after disabling or
+removing the extension.
 
-## Migrate from a loose extension
+### Migration
 
-These are owner actions, not automatic package behavior:
+If you previously installed `context-lean.ts` as a loose extension:
 
-1. Back up the existing loose extension **outside** both `~/.pi/agent/extensions/`
-   and `.pi/extensions/`, and outside any other configured discovery path. Keep
-   the backup for rollback; merely renaming a `.ts` file in place is insufficient.
-2. Disable or move the loose copy out of discovery and remove any explicit
-   registration or launch-time `-e` argument that loads it. Check both scopes.
-3. Install and enable the package in the chosen scope. Start a fresh Pi session.
-4. Inspect loaded resources and settings: there should be exactly one
-   `context-lean` extension path and one `/context-lean` command, with no duplicate
-   registration warnings. `pi list` alone cannot rule out loose-file discovery.
-5. Make a model request, run `/context-lean`, and perform the checks below.
+1. Back it up outside Pi’s extension discovery directories.
+2. Remove or disable the old registration, including any `-e` launch argument.
+   Check both global and project settings; renaming a file in place may not stop
+   discovery.
+3. Install this package and start a fresh session.
+4. Check loaded resources for exactly one Context Lean extension and one
+   `/context-lean` command. `pi list` alone does not reveal loose extensions.
 
-For rollback, disable/remove the package registration first, restore or re-enable
-the backed-up loose copy, and start a fresh session. Verify one instance again.
-Never run the loose and packaged copies concurrently in either direction. This
-package does not delete the old extension or edit your settings itself.
+To roll back, disable or remove the package first, restore the loose copy, and
+start a fresh session. Never run both copies together.
 
-## Verification status
+## Compatibility and limitations
 
-The implementation was developed against inspected Pi **0.85.1** documentation
-and native-read source. Inspection is not runtime compatibility verification.
-No exact Pi/Node version pair has been recorded as completing the release smoke
-checks. Skill-lifecycle, digestion, and statistics checks were owner-reported as
-passed, not independently verified. Installation, migration, removal, and rollback
-qualification remain pending. Git installation is a release gate until a real
-owner-created remote/ref exists. The wildcard Pi peer dependency is not a compatibility guarantee.
-
-There are no automated regression tests in this scope. Only one built-in `read`
-is assumed; replacement readers and arbitrary shell/MCP/custom-tool reads are
-outside the supported lifecycle. New Pi read semantics must be checked before
-claiming compatibility. Uncertain coverage can intentionally save less context.
-
-### Manual qualification checklist
-
-Use a disposable working directory outside your project and a separate Pi config
-directory. For example, in a separate shell:
-
-```bash
-export PI_CODING_AGENT_DIR="$(mktemp -d)"
-workdir="$(mktemp -d)"
-cd "$workdir"
-pi --version
-node --version
-pi install /absolute/path/to/pi-context-lean
-pi list
-pi config
-pi
-```
-
-This isolates Pi configuration, **not system access**. Configure provider access
-for this disposable instance through your normal authentication method. Do not
-copy credentials into this repository. Keep the same config environment and
-working directory for the management checks; closing this shell leaves your
-normal config selection unchanged.
-
-Record exact Pi and Node versions and observed results when performing each check:
-
-- Changed-content whole-file reload, contiguous pagination, uncertain limit-read
-  preservation, wrapper arguments, explicit unload/reload, and rejected markers.
-- An older still-active skill surviving historical digestion; a retired multipart
-  load shrinking without orphan results; mixed groups retaining unrelated output.
-- `/context-lean` counts compared with actual outgoing payloads, including logical
-  loads versus chunks. Inspect outgoing context, not just the command's counters,
-  and compare it with the unchanged saved transcript.
-- Local installation; a disposable loose-copy migration and rollback rehearsal;
-  one loaded instance; command availability after a model request; disabling and
-  removal followed by fresh-session inspection. Do not use the live loose copy
-  for the rehearsal. Confirm the package introduces no `/tmp/out.txt` writes.
-- Source and history review for private material before publication, and Git
-  installation from the real release ref once one exists.
-
-Unchecked behavior is not qualified by this README. Do not treat package loading
-or a successful statistics notification as proof of lifecycle correctness.
+- Developed against Pi **0.85.1** APIs and built-in read semantics. Compatibility
+  with other versions is not established by the wildcard peer dependency.
+- Skill tracking supports native `/skill:name` expansions and the built-in
+  `read`. Shell reads, MCP tools, and replacement readers are outside its scope.
+- Explicit read limits, missing metadata, uncertain paths, and overlapping reads
+  can prevent proving completeness—and therefore reduce savings.
+- State is reconstructed from available context on every pass. It cannot recover
+  history removed by compaction, resolve every filesystem alias, or guarantee an
+  atomic snapshot across paginated reads.
+- Unload origin checks prevent incidental text from acting as a marker; they are
+  not a prompt-injection security boundary.
+- There is no automated regression suite or guaranteed reduction in tokens,
+  latency, or cost. Validate behavior in a disposable session before relying on
+  it for important work.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+[MIT](LICENSE) © 2026 Bruno Llacer Trotti
