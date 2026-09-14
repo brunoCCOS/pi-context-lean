@@ -176,7 +176,13 @@ function reconstructSkillLoads(
   messages: ContextEvent["messages"],
   cwd: string | undefined,
   discovered: Map<string, Set<string>>,
-): { messages: ContextEvent["messages"]; omittedPayloads: number } {
+): {
+  messages: ContextEvent["messages"];
+  skillCallIds: Set<string>;
+  protectedCallIds: Set<string>;
+  retiredLoads: number;
+  omittedPayloads: number;
+} {
   // All message positions, candidates and lifecycle decisions are rebuilt
   // from this context. Never retain them across branches or compaction.
   const names = new Map([...discovered].map(([name, paths]) => [name, new Set(paths)]));
@@ -204,6 +210,9 @@ function reconstructSkillLoads(
   const callCounts = new Map<string, number>();
   const resultIndexes = new Map<string, number[]>();
   const reads: ReadInvocation[] = [];
+  const readCallIds = new Set<string>();
+  const skillCallIds = new Set<string>();
+  const protectedCallIds = new Set<string>();
   messages.forEach((message, index) => {
     if (message.role === "toolResult") {
       const indexes = resultIndexes.get(message.toolCallId) ?? [];
@@ -215,12 +224,27 @@ function reconstructSkillLoads(
       if (call.type !== "toolCall") continue;
       callCounts.set(call.id, (callCounts.get(call.id) ?? 0) + 1);
       if (call.name !== "read") continue;
+      readCallIds.add(call.id);
       const args = record(call.arguments);
       const path = skillPath(args?.path, cwd);
-      if (!args || !path || (basename(path) !== "SKILL.md" && !knownPaths.has(path))) continue;
+      if (path && basename(path) !== "SKILL.md" && !knownPaths.has(path)) continue;
+      // Unresolvable paths may be skill reads too. Keep their results intact;
+      // only a uniquely paired, retired payload can release this protection.
+      skillCallIds.add(call.id);
+      protectedCallIds.add(call.id);
+      if (!args || !path) continue;
       reads.push({ id: call.id, index, path, args, concurrent: false });
     }
   });
+
+  for (const message of messages) {
+    if (message.role !== "toolResult" || message.toolName !== "read") continue;
+    if (!readCallIds.has(message.toolCallId) || callCounts.get(message.toolCallId) !== 1 ||
+        resultIndexes.get(message.toolCallId)?.length !== 1) {
+      skillCallIds.add(message.toolCallId);
+      protectedCallIds.add(message.toolCallId);
+    }
+  }
 
   const readsByPath = new Map<string, ReadInvocation[]>();
   const readResults = new Map<number, ReadInvocation>();
@@ -329,18 +353,25 @@ function reconstructSkillLoads(
   // Only exact payload references are rewritten. All call/result envelopes,
   // unrelated exchanges and saved session objects remain intact.
   const outgoing = [...messages];
+  let retiredLoads = 0;
   let omittedPayloads = 0;
   for (const loads of loadsByPath.values()) {
     for (const load of loads) {
       if (load.status !== "superseded" && load.status !== "unloaded") continue;
+      retiredLoads++;
       const notice = load.status === "unloaded" ? unloadPlaceholder(load.path) : duplicatePlaceholder(load.path);
-      for (const payload of load.payloads) {
-        outgoing[payload.index] = omitPayload(outgoing[payload.index], payload, notice);
+      load.payloads.forEach((payload, index) => {
+        // One full explanation per logical load; later chunks still keep
+        // minimal, self-contained content in their original result envelopes.
+        const text = index === 0 ? notice : `[skill instructions omitted: ${load.status}]`;
+        outgoing[payload.index] = omitPayload(outgoing[payload.index], payload, text);
+        const read = readResults.get(payload.index);
+        if (!payload.wrapper && read) protectedCallIds.delete(read.id);
         omittedPayloads++;
-      }
+      });
     }
   }
-  return { messages: outgoing, omittedPayloads };
+  return { messages: outgoing, skillCallIds, protectedCallIds, retiredLoads, omittedPayloads };
 }
 
 // These are character budgets, not semantic summaries. Never silently imply
@@ -390,17 +421,29 @@ interface CleanupStats {
   excerpted: number;
   protectedGroups: number;
   preservedResults: number;
-  strippedSkills: number;
+  retiredLoads: number;
+  omittedPayloads: number;
 }
 
 function digestToolExchanges(
   messages: ContextEvent["messages"],
+  skillCallIds: Set<string>,
+  protectedCallIds: Set<string>,
   stats: CleanupStats,
 ): ContextEvent["messages"] {
   // A normal final assistant reply is evidence that the preceding tool loop
   // was consumed. Keep the current loop verbatim, including during retries.
   let settledBefore = -1;
+  const callCounts = new Map<string, number>();
+  const resultCounts = new Map<string, number>();
   messages.forEach((message, index) => {
+    if (message.role === "assistant") {
+      for (const block of message.content) {
+        if (block.type === "toolCall") callCounts.set(block.id, (callCounts.get(block.id) ?? 0) + 1);
+      }
+    } else if (message.role === "toolResult") {
+      resultCounts.set(message.toolCallId, (resultCounts.get(message.toolCallId) ?? 0) + 1);
+    }
     if (message.role === "assistant" && message.stopReason === "stop" &&
         !message.content.some((block) => block.type === "toolCall")) {
       settledBefore = index;
@@ -428,11 +471,16 @@ function digestToolExchanges(
     const complete = calls.length > 0 && callIds.size === calls.length &&
       index + calls.length < settledBefore && results.length === calls.length &&
       new Set(results.map((result) => result.toolCallId)).size === calls.length &&
-      calls.every((call) => results.some((result) =>
-        result.toolCallId === call.id && result.toolName === call.name));
+      calls.every((call) => callCounts.get(call.id) === 1 && resultCounts.get(call.id) === 1 &&
+        results.some((result) => result.toolCallId === call.id && result.toolName === call.name));
     // Deferred tool definitions are anchored to their result by providers.
     // Removing that result would also remove the tool's load point.
-    const protectedResult = results.some((result) => result.isError ||
+    // Keep mixed skill/unrelated groups intact even after the skill retires:
+    // omitting instructions must not also shorten a parallel unrelated result.
+    const mixedSkillGroup = results.some((result) => skillCallIds.has(result.toolCallId)) &&
+      results.some((result) => !skillCallIds.has(result.toolCallId));
+    const protectedResult = mixedSkillGroup || results.some((result) =>
+      protectedCallIds.has(result.toolCallId) || result.isError !== false ||
       (result.addedToolNames?.length ?? 0) > 0 ||
       result.content.some((block) => block.type !== "text"));
     if (!complete || protectedResult) {
@@ -512,9 +560,9 @@ export default function (pi: ExtensionAPI) {
         `${saved >= 0 ? "Saved" : "Added"}: ${Math.abs(saved)} (${percent}%). Not tokens or final provider size.`,
         `Tool exchanges digested: ${s.digested}; repeated outputs referenced: ${s.repeated}`,
         `Outputs terminal-cleaned: ${s.cleaned}; exchanges excerpted: ${s.excerpted}`,
-        `Skill payloads omitted (interim count): ${s.strippedSkills}; protected groups: ${s.protectedGroups}`,
-        `Tool digestion temporarily disabled pending lifecycle integration.`,
-        `Tool results kept verbatim by digest pass: ${s.preservedResults} (includes active/incomplete groups)`,
+        `Retired logical skill loads: ${s.retiredLoads}; instruction payloads omitted: ${s.omittedPayloads}`,
+        `Complete tool groups protected from digestion: ${s.protectedGroups}`,
+        `Tool-result envelopes retained: ${s.preservedResults} (may contain skill omission notices)`,
       ].join("\n"), "info");
     },
   });
@@ -553,11 +601,12 @@ export default function (pi: ExtensionAPI) {
       excerpted: 0,
       protectedGroups: 0,
       preservedResults: 0,
-      strippedSkills: reconstructed.omittedPayloads,
+      retiredLoads: reconstructed.retiredLoads,
+      omittedPayloads: reconstructed.omittedPayloads,
     };
-    // Approved step-2 bridge: do not expose active/uncertain skill payloads to
-    // the generic digester until step 3 adds tool-call-ID protection.
-    const outgoing = reconstructed.messages;
+    const outgoing = digestToolExchanges(
+      reconstructed.messages, reconstructed.skillCallIds, reconstructed.protectedCallIds, stats,
+    );
     stats.after = JSON.stringify(outgoing).length;
     stats.preservedResults = outgoing.filter((message) => message.role === "toolResult").length;
     latestStats = stats;
