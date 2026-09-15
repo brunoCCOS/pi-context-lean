@@ -20,24 +20,50 @@ session transcript stays unchanged.
 
 ## Installation
 
-Install from this repository:
+Requires [Pi](https://pi.dev) installed separately. This is a Pi extension,
+not a standalone CLI; use `pi install`, not `npm install -g`, to register it.
+
+### From npm
+
+Install the published package from [npm](https://www.npmjs.com/package/pi-context-lean):
 
 ```bash
-pi install git:github.com/brunoCCOS/pi-context-lean
+pi install npm:pi-context-lean
+```
+
+For a project-only installation:
+
+```bash
+pi install -l npm:pi-context-lean
 ```
 
 Or try it for one session without registering it:
 
 ```bash
-pi -e git:github.com/brunoCCOS/pi-context-lean
+pi -e npm:pi-context-lean
 ```
 
-For a project-only installation, add `-l` to `pi install`. To use a local
-checkout instead:
+To pin version `0.1.0`:
 
 ```bash
+pi install npm:pi-context-lean@0.1.0
+```
+
+Pinned versions are skipped by package updates. To change a pin, install the
+chosen version explicitly.
+
+### From Git or a local checkout
+
+For development or installation directly from source:
+
+```bash
+pi install git:github.com/brunoCCOS/pi-context-lean
+# Or use a local development checkout:
 pi install /absolute/path/to/pi-context-lean
 ```
+
+Installations are user-wide by default. Add `-l` to `pi install` for project
+scope.
 
 Start a fresh Pi session after installing. Context Lean runs automatically
 before each model request; no additional configuration is required.
@@ -45,6 +71,46 @@ before each model request; no additional configuration is required.
 > Pi extensions run with full system access. Review the source before installing,
 > and load only one copy of Context Lean. Remove any previous loose
 > `context-lean.ts` installation first.
+
+### Migrating an existing installation to npm
+
+Run `pi list` to identify the existing source. Remove its registration before
+installing from npm so Pi does not load both copies:
+
+```bash
+pi remove git:github.com/brunoCCOS/pi-context-lean
+pi install npm:pi-context-lean
+```
+
+If the old source is a pinned Git ref or local path, use that exact source in
+`pi remove`. Use `-l` on both commands for a project-only installation.
+For a loose `context-lean.ts`, back it up outside Pi's extension discovery
+folders and remove or disable its old registration first. Keep the backup
+until the npm installation works. Start a fresh session and check that only
+one copy is enabled with `pi config`.
+
+Check both the user and project sections of `pi list`: a local registration
+in either scope can leave a second copy enabled. If `pi remove` does not remove
+the old registration, edit the `packages` array in `~/.pi/agent/settings.json`
+(user scope) or `<project>/.pi/settings.json` (project scope). Remove only the
+matching source string, or the object whose `source` matches it. Relative local
+sources may appear as `..` or another relative path. Keep the JSON valid and
+leave unrelated entries unchanged. Removing a local registration does not
+delete your source checkout.
+
+To roll back, remove the npm registration, reinstall the previous source or
+restore the loose extension, and start a fresh session. Never enable both.
+
+## Updates
+
+```bash
+pi list
+pi update npm:pi-context-lean
+```
+
+Start a fresh Pi session afterward. For a pinned installation, explicitly
+install the desired version instead. Local checkouts use your working files;
+update those yourself rather than editing a Pi-managed npm or Git installation.
 
 ## Usage
 
@@ -113,9 +179,28 @@ transformation, not a semantic summary or transcript deletion. Consult the saved
 transcript when omitted output matters; rerunning a command may have side
 effects or produce different results.
 
+## Verification
+
+The installed npm release **0.1.0** passed **56 isolated runtime smoke checks**
+with Pi **0.85.1** and Node.js **24.16.0**, using Pi's actual extension loader,
+native file reader, and temporary session storage. Checks covered:
+
+- Extension hooks and `/context-lean` command registration.
+- Changed-file skill reloads, unload/reload, and invalid or ambiguous markers.
+- Pagination, gaps, limited reads, oversized lines, and uncertain paths.
+- Skill-wrapper argument and image preservation.
+- Historical digestion, repeated-output references, and tool-call/result pairing.
+- Preservation of active skills, errors, images, and unfinished exchanges.
+- Latest-pass statistics, session reset, and unchanged saved transcripts.
+
+These were ad-hoc checks, not a committed automated test suite. No defects were
+reproduced in those cases; this is not exhaustive verification or a live
+provider/TUI end-to-end test. No model calls were made. Compatibility with
+other Pi or Node.js versions has not been established by these checks.
+
 ## Limitations
 
-- Targets Pi **0.85.1**. Compatibility with other versions is not established.
+- Targets Pi **0.85.1**; see [Verification](#verification) for the checked baseline.
 - Tracks native `/skill:name` expansions and built-in `read` calls, not shell
   reads, MCP tools, or replacement readers.
 - Incomplete reads, uncertain paths, and missing metadata can reduce cleanup.
@@ -127,11 +212,71 @@ effects or produce different results.
 ## Uninstall
 
 ```bash
-pi remove git:github.com/brunoCCOS/pi-context-lean
+pi remove npm:pi-context-lean
 ```
 
-Add `-l` for a project-only installation. If you installed from a local path,
-use that path instead of the Git source. Start a fresh Pi session afterward.
+Add `-l` for a project-only installation. If you installed a pinned npm
+version, from Git, or from a local path, use the exact source shown by
+`pi list` instead. Start a fresh Pi session afterward.
+
+## Publishing (maintainers)
+
+Publication is manual. `pi-context-lean@0.1.0` is published on the public npm
+registry. For a new release, first edit `version` in `package.json` to a new
+semantic version; published name/version pairs cannot be reused.
+
+Run these commands from the repository root in a regular interactive terminal,
+not through Pi's shell runner, so npm can complete browser/2FA approval:
+
+1. Review the release source, README, and MIT license for public distribution.
+   No build step is needed: Pi loads the shipped TypeScript extension directly.
+2. Preview the package without creating a tarball or publishing:
+
+   ```bash
+   npm pack --dry-run --ignore-scripts
+   ```
+
+   Expect exactly `package.json`, `extensions/context-lean.ts`, `README.md`,
+   and `LICENSE`. The `files` allowlist keeps `.local/`, `.pi/`, and other
+   development files out of the npm package.
+3. Authenticate as an npm account allowed to publish this package name:
+
+   ```bash
+   npm login --registry=https://registry.npmjs.org/
+   npm whoami --registry=https://registry.npmjs.org/
+   ```
+
+4. When ready to make the release public, publish and complete npm's requested
+   authentication or two-factor challenge:
+
+   ```bash
+   npm publish --access public --registry=https://registry.npmjs.org/
+   ```
+
+   Login alone does not approve publication. Follow the new authentication URL
+   npm displays, complete the browser challenge, and leave the terminal running
+   until publication finishes. If a browser does not open automatically (for
+   example, under WSL), open the URL manually. An `EOTP` error in a non-interactive
+   shell can mean npm could not start this approval flow; retry in an interactive
+   terminal. Do not share approval URLs, OTPs, or tokens.
+
+   `publishConfig` also sets the public registry and access. Resolve any registry
+   permissions or authentication rejection before announcing the new release.
+5. Confirm the registry version, then check installation in a separate Pi
+   configuration with no other copy of this extension enabled:
+
+   ```bash
+   npm view pi-context-lean version --registry=https://registry.npmjs.org/
+   pi install npm:pi-context-lean
+   ```
+
+   Start a fresh session, make a model request, and inspect `/context-lean`.
+   A package preview alone does not verify runtime behavior.
+
+npm name/version pairs cannot be reused, even after unpublishing. Repository
+README changes do not update the README bundled in an already-published npm
+version; include documentation updates in the next release. No Git commits,
+tags, or pushes are performed by these instructions.
 
 ## License
 

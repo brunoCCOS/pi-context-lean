@@ -1,9 +1,23 @@
 {
   "name": "pi-context-lean",
   "version": "0.1.0",
+  "description": "Pi extension that trims superseded skill instructions and condenses historical tool exchanges without changing saved transcripts.",
   "type": "module",
   "license": "MIT",
-  "keywords": ["pi-package"],
+  "author": "Bruno Llacer Trotti",
+  "homepage": "https://github.com/brunoCCOS/pi-context-lean#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/brunoCCOS/pi-context-lean.git"
+  },
+  "bugs": {
+    "url": "https://github.com/brunoCCOS/pi-context-lean/issues"
+  },
+  "keywords": ["pi-package", "pi-extension", "context", "skills"],
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
   "files": [
     "extensions/context-lean.ts",
     "README.md",
