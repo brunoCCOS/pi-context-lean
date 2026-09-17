@@ -1,282 +1,308 @@
-# pi-context-lean
+# pi-context-lean — keep the instructions you need, drop the history you don't
 
-**Keep the instructions you need. Trim the history you don’t.**
+A [Pi](https://pi.dev) extension that makes each request to the model smaller
+without touching your session file. It does two things on the way out:
 
-A [Pi](https://pi.dev) extension that reduces outgoing context by removing
-superseded skill instructions and condensing old tool exchanges. Your saved
-session transcript stays unchanged.
+- **retires stale skill instructions** — you only keep the newest copy of each
+  skill, not the four times it got re-read;
+- **condenses finished tool exchanges** — old `bash`/`read` round-trips become
+  short labelled digests instead of full transcripts.
 
-## Features
+Your saved transcript on disk is never modified. Context Lean rewrites the
+*copy* of the conversation that goes to the provider, once per request.
 
-- **Skill-aware cleanup.** Keeps the latest complete load of each active skill
-  and omits older copies, including instructions from before a file was edited.
-- **Explicit unloading.** Lets the assistant retire skills it no longer needs
-  and load them again later.
-- **Compact tool history.** Replaces completed historical tool exchanges with
-  labeled digests, bounded excerpts, and references to repeated output.
-- **Conservative preservation.** Leaves active or uncertain skill reads, errors,
-  images, and unfinished tool exchanges out of generic digestion.
-- **Visible savings.** `/context-lean` shows what changed in the latest pass.
+## Why this exists
 
-## Installation
+Long sessions rot in a very specific way. You load a skill, the agent reads
+`SKILL.md` — three thousand tokens of instructions. Twenty turns later it reads
+the same file again, because the file changed, or because a subagent came back,
+or just because it forgot. Now you're paying for both copies, and the model has
+to guess which one is current. Meanwhile the `npm test` output from an hour ago
+is still sitting in context in full, complete with a progress bar rendered one
+carriage-return frame at a time.
 
-Requires [Pi](https://pi.dev) installed separately. This is a Pi extension,
-not a standalone CLI; use `pi install`, not `npm install -g`, to register it.
+None of that is *wrong*, exactly. It just isn't useful anymore, and it's
+crowding out things that are. The usual remedy is compaction, which is lossy in
+a way you can't predict and throws away recent detail along with the old.
 
-### From npm
+Context Lean takes the narrower bet: some parts of the history are provably
+superseded, and those can go without anyone having to summarize anything. A
+skill read that was replaced by a newer complete read of the same file is dead
+weight. A tool call whose result the assistant already used and replied about is
+history. Everything else is left exactly as it was.
 
-Install the published package from [npm](https://www.npmjs.com/package/pi-context-lean):
+The design rule throughout is **fail closed**: when the extension can't prove
+something is safe to drop, it keeps it verbatim.
 
-```bash
-pi install npm:pi-context-lean
+## What you get
+
+| | |
+| --- | --- |
+| **Skill-aware cleanup** | Keeps the latest complete load of each skill; older copies become a one-line notice. Survives file edits — a re-read after an edit supersedes the pre-edit copy, not the other way round. |
+| **Explicit unloading** | The agent can retire a skill it's finished with, and load it again later. See [Unloading](#unloading-a-skill). |
+| **Compact tool history** | Completed historical exchanges collapse into labelled digests with bounded excerpts (300 chars of arguments, 800 of output). |
+| **Repeat detection** | Two identical exchanges? The second points at the first instead of repeating it. |
+| **Terminal de-noising** | Carriage-return progress spam (`Downloading 12% … 34% … 87%`) collapses to its last frame — but only for output that matches a recognizable progress template, so real diagnostics never get mistaken for disposable frames. |
+| **Visible effect** | `/context-lean` reports what the last pass actually did. |
+
+## How it works
+
+Every time Pi is about to call the model, the extension gets the outgoing
+message list, rebuilds what happened, and rewrites it:
+
+```text
+Session history (on disk, untouched)   Context sent to the model
+────────────────────────────────────   ──────────────────────────────────
+Read skills/foo/SKILL.md               "[skill was loaded again — keeping
+                                        only the most recent copy]"
+…file gets edited…
+Read skills/foo/SKILL.md again         full, current instructions
+bash npm test  (finished, replied to)  Tool exchange #1: bash {...} + excerpt
+read src/app.ts (current loop)         unchanged
 ```
 
-For a project-only installation:
+Two mechanisms, both conservative.
+
+### Retiring skill loads
+
+The extension reconstructs skill loads from two sources: Pi's native
+`/skill:name` expansion (the `<skill name=… location=…>` wrapper in a user
+message) and built-in `read` calls on a `SKILL.md`. Identity is the resolved
+**file path**, decided lexically — it never stats the filesystem or compares
+today's file contents against what history says was read, because that would
+make cleanup depend on the state of your disk rather than the state of the
+conversation.
+
+A load only counts as *complete* when coverage runs from line 1 to end-of-file.
+Paginated reads are stitched together, but only when the extension can prove
+contiguous coverage from the read's own truncation metadata — never by parsing
+"… 40 more lines" footers out of the text. If coverage can't be established, the
+load stays a candidate and its instructions are kept.
+
+Once a newer complete load exists, older ones are replaced with a short notice
+in place. Only the instruction payload is rewritten; the tool call and result
+envelopes around it stay intact so the transcript structure and tool pairing are
+never disturbed.
+
+Deliberately preserved: reads that failed or returned an error, non-text or
+image results, ambiguous or unresolvable paths, overlapping concurrent reads of
+the same file, and anything read in a session whose working directory has moved
+since (relative paths can't be resolved safely there, so only absolute
+identities still work).
+
+### Digesting tool exchanges
+
+Only exchanges *before the assistant's last normal reply* are eligible — a
+finished reply is the evidence that the loop was consumed. The current tool loop
+is always left verbatim, including mid-retry.
+
+A group is digested only if it's whole, contiguous, and unambiguous: every call
+has exactly one matching result, no duplicate IDs, nothing interleaved. Calls
+and their results are always replaced together, so the model never sees a call
+without its answer.
+
+Left alone, on purpose:
+
+- errors (`isError`) — the failure detail is usually the point;
+- images and other non-text blocks;
+- results that registered deferred tool definitions (removing the result would
+  remove the tool's load point);
+- groups mixing a skill read with unrelated tools — retiring instructions must
+  not quietly shorten a parallel result that had nothing to do with it;
+- reasoning blocks from a tool-calling message: spoken text is kept, but
+  reasoning that accompanied now-removed calls isn't replayed.
+
+> **Digests are excerpts, not summaries.** This is a lossy character-budget
+> transformation, not semantic compression. If omitted output matters, read the
+> saved transcript — re-running the command may have side effects or give a
+> different answer.
+
+## Install
+
+Requires Pi. This is an extension, not a standalone CLI — use `pi install`, not
+`npm install -g`.
 
 ```bash
-pi install -l npm:pi-context-lean
+pi install npm:pi-context-lean          # user-wide
+pi install -l npm:pi-context-lean       # project-only (.pi/settings.json)
+pi -e npm:pi-context-lean               # try it for one session, no registration
+pi install npm:pi-context-lean@0.1.0    # pin a version (skipped by pi update)
 ```
 
-Or try it for one session without registering it:
-
-```bash
-pi -e npm:pi-context-lean
-```
-
-To pin version `0.1.0`:
-
-```bash
-pi install npm:pi-context-lean@0.1.0
-```
-
-Pinned versions are skipped by package updates. To change a pin, install the
-chosen version explicitly.
-
-### From Git or a local checkout
-
-For development or installation directly from source:
+From source, for development:
 
 ```bash
 pi install git:github.com/brunoCCOS/pi-context-lean
-# Or use a local development checkout:
 pi install /absolute/path/to/pi-context-lean
 ```
 
-Installations are user-wide by default. Add `-l` to `pi install` for project
-scope.
+Start a fresh session afterwards. There's nothing to configure — it runs before
+each model request on its own.
 
-Start a fresh Pi session after installing. Context Lean runs automatically
-before each model request; no additional configuration is required.
+> Pi extensions run with full system access; read the source before installing.
+> Load exactly **one** copy — if you had a loose `context-lean.ts` lying in an
+> extension folder, remove or disable it first, and check both the user and
+> project sections of `pi list`. Two copies will each try to rewrite the same
+> context.
 
-> Pi extensions run with full system access. Review the source before installing,
-> and load only one copy of Context Lean. Remove any previous loose
-> `context-lean.ts` installation first.
-
-### Migrating an existing installation to npm
-
-Run `pi list` to identify the existing source. Remove its registration before
-installing from npm so Pi does not load both copies:
+Updating and removing:
 
 ```bash
-pi remove git:github.com/brunoCCOS/pi-context-lean
-pi install npm:pi-context-lean
-```
-
-If the old source is a pinned Git ref or local path, use that exact source in
-`pi remove`. Use `-l` on both commands for a project-only installation.
-For a loose `context-lean.ts`, back it up outside Pi's extension discovery
-folders and remove or disable its old registration first. Keep the backup
-until the npm installation works. Start a fresh session and check that only
-one copy is enabled with `pi config`.
-
-Check both the user and project sections of `pi list`: a local registration
-in either scope can leave a second copy enabled. If `pi remove` does not remove
-the old registration, edit the `packages` array in `~/.pi/agent/settings.json`
-(user scope) or `<project>/.pi/settings.json` (project scope). Remove only the
-matching source string, or the object whose `source` matches it. Relative local
-sources may appear as `..` or another relative path. Keep the JSON valid and
-leave unrelated entries unchanged. Removing a local registration does not
-delete your source checkout.
-
-To roll back, remove the npm registration, reinstall the previous source or
-restore the loose extension, and start a fresh session. Never enable both.
-
-## Updates
-
-```bash
-pi list
 pi update npm:pi-context-lean
+pi remove npm:pi-context-lean
 ```
 
-Start a fresh Pi session afterward. For a pinned installation, explicitly
-install the desired version instead. Local checkouts use your working files;
-update those yourself rather than editing a Pi-managed npm or Git installation.
+Use the exact source string shown by `pi list` (pinned version, Git ref, or
+local path), add `-l` for project scope, and start a fresh session after. If
+`pi remove` leaves a registration behind, remove the matching entry from the
+`packages` array in `~/.pi/agent/settings.json` or `<project>/.pi/settings.json`
+by hand. Removing a local registration never deletes your checkout.
 
 ## Usage
 
 ### Load skills as usual
 
-Use `/skill:name` or let the assistant read a skill’s `SKILL.md` with Pi’s
-built-in `read` tool. The latest complete instructions remain active; older
-loads are omitted from subsequent model requests. User arguments accompanying
-`/skill:name` are preserved.
+Use `/skill:name`, or let the agent `read` a `SKILL.md`. The newest complete
+instructions stay active; older loads drop out of later requests. Arguments you
+passed alongside `/skill:name` are preserved byte-for-byte, whitespace included.
 
-Partial reads are combined only when the extension can establish complete
-coverage from line 1 through the end of the file. Otherwise, it keeps the
-instructions rather than risk dropping them.
+### Unloading a skill
 
-### Unload a skill
-
-Ask the assistant to unload a skill it no longer needs. The assistant must send
-a final reply containing only this marker, with the skill’s name:
+Ask the agent to unload a skill it's done with. It retires the skill by sending
+a final reply containing nothing but the marker:
 
 ```text
 [[UNLOAD_SKILL:example-skill]]
 ```
 
-This is an **assistant marker, not a slash command**. Pasting it as a user
-message does not unload anything. Multiple markers may appear on separate
-lines, but the reply must contain no other prose, code fences, or tool calls
-and must finish normally. Names may contain only lowercase letters, digits,
-and hyphens, and must identify one skill path unambiguously.
+This is an **assistant marker, not a slash command** — pasting it yourself as a
+user message does nothing. Several markers may appear on their own lines, but
+the reply must contain no other prose, no code fences and no tool calls, and
+must finish normally. Names are lowercase letters, digits and hyphens, and must
+resolve to exactly one skill path (ambiguous names are ignored rather than
+guessed at). Reading the skill again, or `/skill:name`, brings it back.
 
-Reading the skill again or invoking `/skill:name` reloads it.
+The marker convention is cooperative, not a security boundary — see
+[Limits](#limits).
 
-### Check context savings
-
-After a model request, run:
+### Seeing what it did
 
 ```text
 /context-lean
 ```
 
-The notification shows message size before and after cleanup, retired skill
-loads, digested tool exchanges, repeated-output references, and preservation
-counts.
+Reports serialized characters before and after, retired skill loads, digested
+exchanges, repeated-output references, terminal-cleaned and excerpted outputs,
+and how many groups were protected from digestion.
 
-These figures describe the **latest pass**, not cumulative savings. Sizes are
-serialized message characters—not tokens or final provider request size.
-A pass can increase size; token, latency, and cost reductions are not guaranteed.
+Read those numbers honestly: they describe the **latest pass only**, they count
+serialized message characters rather than tokens or final provider request size,
+and a pass can legitimately come out *larger*. Token, latency and cost savings
+are plausible consequences, not guarantees.
 
-## How it works
+## Limits
+
+- Built and checked against Pi **0.85.1** and Node **24.16.0**. Other versions
+  are untested, and the read-coverage logic is deliberately tied to the shape of
+  Pi's built-in `read` metadata.
+- Tracks native `/skill:name` expansion and the built-in `read` tool only — not
+  shell `cat`, MCP file tools, or replacement readers.
+- Incomplete reads, uncertain paths and missing metadata all reduce cleanup, by
+  design. Less cleanup is the safe failure mode.
+- Works only from the context it's handed each pass. It can't recover history
+  already removed by compaction, and can't guarantee a consistent file snapshot
+  across paginated reads.
+- Unload-marker validation is a correctness check, not a prompt-injection
+  defense. Don't treat it as one.
+
+### What was actually verified
+
+Release 0.1.0 passed 56 isolated runtime smoke checks against Pi 0.85.1 and Node
+24.16.0, using Pi's real extension loader, native file reader, and temporary
+session storage — covering hook and command registration, changed-file reloads,
+unload/reload and malformed markers, pagination and gaps, oversized lines,
+wrapper argument and image preservation, digestion and call/result pairing,
+preservation of active skills and errors, statistics, session reset, and that
+saved transcripts stay byte-identical.
+
+These were ad-hoc checks, not a committed test suite. No model calls were made,
+and there was no live provider or TUI end-to-end run. Treat it as "the paths I
+exercised behaved", not as exhaustive verification.
+
+## Repo layout
 
 ```text
-Session history                      Context sent to the model
-──────────────────────────────────   ──────────────────────────────────
-Read a skill                         Notice: older skill load omitted
-Read the same skill after an edit    Latest complete instructions
-Old, completed command exchange      Historical digest with excerpts
-Current tool exchange                Unchanged
+package.json                  pi package manifest (pi.extensions)
+extensions/context-lean.ts    the whole extension — Pi loads the TS directly
 ```
 
-Only complete tool exchanges before a normal final assistant reply are eligible
-for digestion. Calls and their matching results are replaced together; the
-current tool loop stays intact. Groups with ambiguous pairing or a mix of skill
-reads and unrelated tools are preserved.
+## Releasing (maintainers)
 
-Digests retain excerpts, **not every detail**. This is a lossy context
-transformation, not a semantic summary or transcript deletion. Consult the saved
-transcript when omitted output matters; rerunning a command may have side
-effects or produce different results.
+No build step: Pi loads the shipped TypeScript as-is.
 
-## Verification
-
-The installed npm release **0.1.0** passed **56 isolated runtime smoke checks**
-with Pi **0.85.1** and Node.js **24.16.0**, using Pi's actual extension loader,
-native file reader, and temporary session storage. Checks covered:
-
-- Extension hooks and `/context-lean` command registration.
-- Changed-file skill reloads, unload/reload, and invalid or ambiguous markers.
-- Pagination, gaps, limited reads, oversized lines, and uncertain paths.
-- Skill-wrapper argument and image preservation.
-- Historical digestion, repeated-output references, and tool-call/result pairing.
-- Preservation of active skills, errors, images, and unfinished exchanges.
-- Latest-pass statistics, session reset, and unchanged saved transcripts.
-
-These were ad-hoc checks, not a committed automated test suite. No defects were
-reproduced in those cases; this is not exhaustive verification or a live
-provider/TUI end-to-end test. No model calls were made. Compatibility with
-other Pi or Node.js versions has not been established by these checks.
-
-## Limitations
-
-- Targets Pi **0.85.1**; see [Verification](#verification) for the checked baseline.
-- Tracks native `/skill:name` expansions and built-in `read` calls, not shell
-  reads, MCP tools, or replacement readers.
-- Incomplete reads, uncertain paths, and missing metadata can reduce cleanup.
-- Works from the context available on each pass. It cannot recover history
-  removed by compaction or guarantee a consistent file snapshot across
-  paginated reads.
-- Unload-marker checks are not a prompt-injection security boundary.
-
-## Uninstall
+Bump `version` in `package.json` first — npm name/version pairs can never be
+reused, even after an unpublish. Then, from an ordinary interactive terminal
+(not through Pi's shell runner, so npm can finish its browser/2FA challenge):
 
 ```bash
-pi remove npm:pi-context-lean
+npm pack --dry-run --ignore-scripts     # expect exactly 4 files
+npm login  --registry=https://registry.npmjs.org/
+npm whoami --registry=https://registry.npmjs.org/
+npm publish --access public --registry=https://registry.npmjs.org/
 ```
 
-Add `-l` for a project-only installation. If you installed a pinned npm
-version, from Git, or from a local path, use the exact source shown by
-`pi list` instead. Start a fresh Pi session afterward.
+`npm pack` should list only `package.json`, `extensions/context-lean.ts`,
+`README.md` and `LICENSE` — the `files` allowlist keeps `.local/` and `.pi/` out
+of the tarball. Login alone doesn't approve a publish: follow the URL npm
+prints, complete the browser challenge (open it manually under WSL), and leave
+the terminal running until it finishes. An `EOTP` error usually means npm
+couldn't start that flow — retry interactively. Never share approval URLs, OTPs
+or tokens.
 
-## Publishing (maintainers)
+Then verify for real, in a Pi configuration with no other copy enabled:
 
-Publication is manual. `pi-context-lean@0.1.0` is published on the public npm
-registry. For a new release, first edit `version` in `package.json` to a new
-semantic version; published name/version pairs cannot be reused.
+```bash
+npm view pi-context-lean version
+pi install npm:pi-context-lean
+```
 
-Run these commands from the repository root in a regular interactive terminal,
-not through Pi's shell runner, so npm can complete browser/2FA approval:
+Start a session, make a request, check `/context-lean`. A package preview proves
+nothing about runtime behaviour. Note that README changes in this repo do *not*
+update the README bundled in an already-published version — docs ship with the
+next release.
 
-1. Review the release source, README, and MIT license for public distribution.
-   No build step is needed: Pi loads the shipped TypeScript extension directly.
-2. Preview the package without creating a tarball or publishing:
+### Getting listed in the Pi package gallery
 
-   ```bash
-   npm pack --dry-run --ignore-scripts
-   ```
+There is **no PR to the pi repo** for this, and you shouldn't open one. Pi lives
+at [earendil-works/pi](https://github.com/earendil-works/pi) as a monorepo
+(`packages/coding-agent`), and its `CONTRIBUTING.md` is about contributing to pi
+itself — it has a strict contribution gate and auto-closes unsolicited issues and
+PRs. Third-party packages are not vendored there.
 
-   Expect exactly `package.json`, `extensions/context-lean.ts`, `README.md`,
-   and `LICENSE`. The `files` allowlist keeps `.local/`, `.pi/`, and other
-   development files out of the npm package.
-3. Authenticate as an npm account allowed to publish this package name:
+Instead, [pi.dev/packages](https://pi.dev/packages) is generated automatically
+from npm: it lists packages published with the `pi-package` keyword, tags each
+card by resource type (extension / skill / theme / prompt) from the `pi`
+manifest, and links back to npm and the repo. You can filter by `?name=` and
+`?type=`, and sort by downloads or recency. Publishing with the right keyword
+*is* the submission.
 
-   ```bash
-   npm login --registry=https://registry.npmjs.org/
-   npm whoami --registry=https://registry.npmjs.org/
-   ```
+This package already ships `"keywords": ["pi-package", "pi-extension", …]`, so
+nothing more is required. Listing is not instant, though: the gallery depends on
+npm's **search index**, which lags behind the registry by noticeably longer than
+the publish itself. A package can be installable via `pi install npm:…` while
+still absent from both `npm search` and the gallery. Check with:
 
-4. When ready to make the release public, publish and complete npm's requested
-   authentication or two-factor challenge:
+```bash
+curl -s 'https://registry.npmjs.org/-/v1/search?text=pi-context-lean' | grep -c pi-context-lean
+```
 
-   ```bash
-   npm publish --access public --registry=https://registry.npmjs.org/
-   ```
+Once that returns a hit, the gallery picks it up on its own. Optionally add a
+preview to the `pi` manifest — `"image"` (PNG/JPEG/GIF/WebP) or `"video"`
+(MP4 only, which takes precedence and autoplays on hover):
 
-   Login alone does not approve publication. Follow the new authentication URL
-   npm displays, complete the browser challenge, and leave the terminal running
-   until publication finishes. If a browser does not open automatically (for
-   example, under WSL), open the URL manually. An `EOTP` error in a non-interactive
-   shell can mean npm could not start this approval flow; retry in an interactive
-   terminal. Do not share approval URLs, OTPs, or tokens.
-
-   `publishConfig` also sets the public registry and access. Resolve any registry
-   permissions or authentication rejection before announcing the new release.
-5. Confirm the registry version, then check installation in a separate Pi
-   configuration with no other copy of this extension enabled:
-
-   ```bash
-   npm view pi-context-lean version --registry=https://registry.npmjs.org/
-   pi install npm:pi-context-lean
-   ```
-
-   Start a fresh session, make a model request, and inspect `/context-lean`.
-   A package preview alone does not verify runtime behavior.
-
-npm name/version pairs cannot be reused, even after unpublishing. Repository
-README changes do not update the README bundled in an already-published npm
-version; include documentation updates in the next release. No Git commits,
-tags, or pushes are performed by these instructions.
+```json
+{ "pi": { "extensions": ["extensions/context-lean.ts"], "image": "https://…/demo.png" } }
+```
 
 ## License
 
