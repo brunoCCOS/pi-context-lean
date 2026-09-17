@@ -271,38 +271,6 @@ nothing about runtime behaviour. Note that README changes in this repo do *not*
 update the README bundled in an already-published version — docs ship with the
 next release.
 
-### Getting listed in the Pi package gallery
-
-There is **no PR to the pi repo** for this, and you shouldn't open one. Pi lives
-at [earendil-works/pi](https://github.com/earendil-works/pi) as a monorepo
-(`packages/coding-agent`), and its `CONTRIBUTING.md` is about contributing to pi
-itself — it has a strict contribution gate and auto-closes unsolicited issues and
-PRs. Third-party packages are not vendored there.
-
-Instead, [pi.dev/packages](https://pi.dev/packages) is generated automatically
-from npm: it lists packages published with the `pi-package` keyword, tags each
-card by resource type (extension / skill / theme / prompt) from the `pi`
-manifest, and links back to npm and the repo. You can filter by `?name=` and
-`?type=`, and sort by downloads or recency. Publishing with the right keyword
-*is* the submission.
-
-This package already ships `"keywords": ["pi-package", "pi-extension", …]`, so
-nothing more is required. Listing is not instant, though: the gallery depends on
-npm's **search index**, which lags behind the registry by noticeably longer than
-the publish itself. A package can be installable via `pi install npm:…` while
-still absent from both `npm search` and the gallery. Check with:
-
-```bash
-curl -s 'https://registry.npmjs.org/-/v1/search?text=pi-context-lean' | grep -c pi-context-lean
-```
-
-Once that returns a hit, the gallery picks it up on its own. Optionally add a
-preview to the `pi` manifest — `"image"` (PNG/JPEG/GIF/WebP) or `"video"`
-(MP4 only, which takes precedence and autoplays on hover):
-
-```json
-{ "pi": { "extensions": ["extensions/context-lean.ts"], "image": "https://…/demo.png" } }
-```
 
 ## License
 
